@@ -450,6 +450,7 @@ fn render_signal(mut w: impl Write, signal: &Signal, dbc: &DBC, msg: &Message) -
     writeln!(w)?;
 
     render_set_signal(&mut w, signal, msg)?;
+    render_set_signal_exact(&mut w, signal, dbc, msg)?;
 
     Ok(())
 }
@@ -501,6 +502,90 @@ fn render_set_signal(mut w: impl Write, signal: &Signal, msg: &Message) -> Resul
 
     writeln!(&mut w, "}}")?;
     writeln!(w)?;
+
+    Ok(())
+}
+
+fn render_set_signal_exact(
+    mut w: impl Write,
+    signal: &Signal,
+    dbc: &DBC,
+    msg: &Message,
+) -> Result<()> {
+    if let Some(variants) = dbc.value_descriptions_for_signal(*msg.message_id(), signal.name()) {
+        writeln!(
+            &mut w,
+            "/// Set value of {} based on exact type",
+            signal.name()
+        )?;
+        writeln!(w, "#[inline(always)]")?;
+
+        // To avoid accidentially changing the multiplexor value without changing
+        // the signals accordingly this fn is kept private for multiplexors.
+        let visibility = if *signal.multiplexer_indicator() == MultiplexIndicator::Multiplexor {
+            ""
+        } else {
+            "pub "
+        };
+
+        let type_name = enum_name(msg, signal);
+        writeln!(
+            w,
+            "{}fn set_{}_exact(&mut self, value: {}) -> Result<(), CanError> {{",
+            visibility,
+            field_name(signal.name()),
+            type_name
+        )?;
+
+        {
+            let mut w = PadAdapter::wrap(&mut w);
+            writeln!(w, "if let Some(enum_val) = match value {{")?;
+            {
+                let mut w = PadAdapter::wrap(&mut w);
+                let enum_type = num_bits_to_rust_type(signal.signal_size)
+                    .map_err(|err| anyhow!("Unable to get rust data type for signal: {:?}", err))?;
+                for variant in variants {
+                    writeln!(
+                        &mut w,
+                        "{}::{} => Some({}{}),",
+                        type_name,
+                        enum_variant_name(variant.b()),
+                        *variant.a(),
+                        enum_type,
+                    )?;
+                }
+                writeln!(&mut w, "_ => None,")?;
+            }
+            writeln!(&mut w, "}} {{")?;
+            {
+                let mut w = PadAdapter::wrap(&mut w);
+                signal_store_raw(&mut w, signal, msg, "enum_val")?;
+                writeln!(&mut w, "Ok(())")?;
+            }
+            writeln!(
+                &mut w,
+                "}} else if let {}::_Other(val) = value {{",
+                type_name
+            )?;
+            {
+                let mut w = PadAdapter::wrap(&mut w);
+                writeln!(&mut w, "self.set_{}(val)", field_name(signal.name()))?;
+            }
+            writeln!(&mut w, "}} else {{")?;
+            {
+                let mut w = PadAdapter::wrap(&mut w);
+                writeln!(
+                    &mut w,
+                    "Err(CanError::ParameterOutOfRange {{message_id: {},}})",
+                    msg.message_id().0
+                )?;
+            }
+            writeln!(&mut w, "}}")?;
+        }
+
+        writeln!(&mut w, "}}")?;
+        writeln!(w)?;
+    }
 
     Ok(())
 }
@@ -758,26 +843,7 @@ fn signal_to_payload(mut w: impl Write, signal: &Signal, msg: &Message) -> Resul
         )?;
     };
 
-    match signal.byte_order() {
-        can_dbc::ByteOrder::LittleEndian => {
-            let (start_bit, end_bit) = le_start_end_bit(signal, msg)?;
-            writeln!(
-                &mut w,
-                r#"self.raw.view_bits_mut::<Lsb0>()[{start_bit}..{end_bit}].store_le(value);"#,
-                start_bit = start_bit,
-                end_bit = end_bit,
-            )?;
-        }
-        can_dbc::ByteOrder::BigEndian => {
-            let (start_bit, end_bit) = be_start_end_bit(signal, msg)?;
-            writeln!(
-                &mut w,
-                r#"self.raw.view_bits_mut::<Msb0>()[{start_bit}..{end_bit}].store_be(value);"#,
-                start_bit = start_bit,
-                end_bit = end_bit,
-            )?;
-        }
-    };
+    signal_store_raw(&mut w, signal, msg, "value")?;
 
     writeln!(&mut w, "Ok(())")?;
     Ok(())
@@ -840,6 +906,33 @@ fn write_enum(
     }
     writeln!(w, "}}")?;
     writeln!(w)?;
+    Ok(())
+}
+
+fn signal_store_raw(
+    mut w: impl Write,
+    signal: &Signal,
+    msg: &Message,
+    var: &'static str,
+) -> Result<()> {
+    match signal.byte_order() {
+        can_dbc::ByteOrder::LittleEndian => {
+            let (start_bit, end_bit) = le_start_end_bit(signal, msg)?;
+            writeln!(
+                &mut w,
+                r#"self.raw.view_bits_mut::<Lsb0>()[{}..{}].store_le({});"#,
+                start_bit, end_bit, var,
+            )?;
+        }
+        can_dbc::ByteOrder::BigEndian => {
+            let (start_bit, end_bit) = be_start_end_bit(signal, msg)?;
+            writeln!(
+                &mut w,
+                r#"self.raw.view_bits_mut::<Msb0>()[{}..{}].store_be({});"#,
+                start_bit, end_bit, var,
+            )?;
+        }
+    };
     Ok(())
 }
 
@@ -920,6 +1013,19 @@ fn enum_variant_name(x: &str) -> String {
         format!("X{}", x.to_pascal_case())
     } else {
         x.to_pascal_case()
+    }
+}
+
+fn num_bits_to_rust_type(
+    num_bits: u64,
+) -> std::result::Result<&'static str, std::num::IntErrorKind> {
+    match num_bits {
+        n if n < 9 => Ok("u8"),
+        n if n < 17 => Ok("u16"),
+        n if n < 33 => Ok("u32"),
+        n if n < 65 => Ok("u64"),
+        n if n < 129 => Ok("u128"),
+        _ => Err(std::num::IntErrorKind::PosOverflow),
     }
 }
 
