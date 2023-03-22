@@ -197,21 +197,24 @@ fn render_message(mut w: impl Write, msg: &Message, dbc: &DBC) -> Result<()> {
             "/// Construct new {} from values",
             msg.message_name()
         )?;
-        let args: Vec<String> = msg
+
+        let signals: Vec<&can_dbc::Signal> = msg
             .signals()
             .iter()
-            .filter_map(|signal| {
-                if *signal.multiplexer_indicator() == MultiplexIndicator::Plain
-                    || *signal.multiplexer_indicator() == MultiplexIndicator::Multiplexor
-                {
-                    Some(format!(
-                        "{}: {}",
-                        field_name(signal.name()),
-                        signal_to_rust_type(signal)
-                    ))
-                } else {
-                    None
-                }
+            .filter(|signal| {
+                MultiplexIndicator::Multiplexor == *signal.multiplexer_indicator()
+                    || MultiplexIndicator::Plain == *signal.multiplexer_indicator()
+            })
+            .collect();
+
+        let args: Vec<String> = signals
+            .iter()
+            .map(|signal| {
+                format!(
+                    "{}: {}",
+                    field_name(signal.name()),
+                    signal_to_rust_type(signal)
+                )
             })
             .collect();
         writeln!(
@@ -226,12 +229,50 @@ fn render_message(mut w: impl Write, msg: &Message, dbc: &DBC) -> Result<()> {
                 "let mut res = Self {{ raw: [0u8; {}] }};",
                 msg.message_size()
             )?;
-            for signal in msg.signals().iter() {
-                if *signal.multiplexer_indicator() == MultiplexIndicator::Plain {
-                    writeln!(&mut w, "res.set_{0}({0})?;", field_name(signal.name()))?;
-                }
+            for signal in &signals {
+                writeln!(&mut w, "res.set_{0}({0})?;", field_name(signal.name()))?;
+            }
+            writeln!(&mut w, "Ok(res)")?;
+        }
+        writeln!(&mut w, "}}")?;
+        writeln!(w)?;
 
-                if *signal.multiplexer_indicator() == MultiplexIndicator::Multiplexor {
+        let args: Vec<String> = signals
+            .iter()
+            .map(|signal| {
+                if let Some(_) = dbc.value_descriptions_for_signal(*msg.message_id(), signal.name())
+                {
+                    format!("{}: {}", field_name(signal.name()), enum_name(msg, signal))
+                } else {
+                    format!(
+                        "{}: {}",
+                        field_name(signal.name()),
+                        signal_to_rust_type(signal)
+                    )
+                }
+            })
+            .collect();
+        writeln!(
+            &mut w,
+            "pub fn new_exact({}) -> Result<Self, CanError> {{",
+            args.join(", ")
+        )?;
+        {
+            let mut w = PadAdapter::wrap(&mut w);
+            writeln!(
+                &mut w,
+                "let mut res = Self {{ raw: [0u8; {}] }};",
+                msg.message_size()
+            )?;
+            for signal in &signals {
+                if let Some(_) = dbc.value_descriptions_for_signal(*msg.message_id(), signal.name())
+                {
+                    writeln!(
+                        &mut w,
+                        "res.set_{0}_exact({0})?;",
+                        field_name(signal.name())
+                    )?;
+                } else {
                     writeln!(&mut w, "res.set_{0}({0})?;", field_name(signal.name()))?;
                 }
             }
